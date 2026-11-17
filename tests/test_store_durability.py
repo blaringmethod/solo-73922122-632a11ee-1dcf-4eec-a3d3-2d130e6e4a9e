@@ -97,3 +97,37 @@ def test_commit_and_watermark_are_one_transaction(tmp_path, monkeypatch):
     assert store.get_run(run["id"])["status"] == "running"  # still open for retry/cleanup
     store.finish_failed(run["id"], "simulated")
     store.close()
+
+
+def test_legacy_catalog_is_migrated_with_content_tokens(tmp_path):
+    """A catalogue created before the duplicates page gets fresh tokens."""
+    db = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE catalog (
+            identifier TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            creator TEXT,
+            source_datestamp TEXT NOT NULL,
+            harvested_at TEXT NOT NULL
+        );
+        INSERT INTO catalog VALUES
+            ('oai:old:1', '旧标题', '作者', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z'),
+            ('oai:old:2', '旧标题', '作者', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db)
+    try:
+        overview = store.duplicate_overview()
+        assert overview["counts"]["pending"] == 1  # migration groups them
+        pair = overview["pending"][0]
+        assert pair["left"]["content_token"]
+        assert pair["right"]["content_token"]
+    finally:
+        store.close()

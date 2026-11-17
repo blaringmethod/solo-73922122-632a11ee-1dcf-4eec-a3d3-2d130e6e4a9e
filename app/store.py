@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .duplicates import canonical_identifiers, grouping_key
+
 
 def utc_now_millis() -> str:
     return (
@@ -97,15 +99,55 @@ class Store:
                     title TEXT NOT NULL,
                     creator TEXT,
                     source_datestamp TEXT NOT NULL,
-                    harvested_at TEXT NOT NULL
+                    harvested_at TEXT NOT NULL,
+                    content_token TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_catalog_title ON catalog(title);
+
+                CREATE TABLE IF NOT EXISTS duplicate_judgements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    left_identifier TEXT NOT NULL,
+                    right_identifier TEXT NOT NULL,
+                    left_token TEXT NOT NULL,
+                    right_token TEXT NOT NULL,
+                    verdict TEXT NOT NULL CHECK (verdict IN ('same', 'different')),
+                    created_at TEXT NOT NULL,
+                    CHECK (left_identifier < right_identifier)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_duplicate_pair
+                    ON duplicate_judgements(left_identifier, right_identifier, id);
 
                 INSERT OR IGNORE INTO published_state
                     (id, watermark, updated_at, success_count, last_run_id)
                 VALUES (1, NULL, NULL, 0, NULL);
                 """
+            )
+            self._migrate_catalog_tokens()
+
+    def _migrate_catalog_tokens(self) -> None:
+        """Add the content token to catalogues created before duplicates existed.
+
+        Every existing row gets a fresh token; from then on a token only
+        changes when the published title or creator actually changes.  Tokens
+        are never reused, so a withdrawn-then-restored record can never make an
+        old judgement valid again.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(catalog)")
+        }
+        if "content_token" not in columns:
+            self._conn.execute("ALTER TABLE catalog ADD COLUMN content_token TEXT")
+        missing = self._conn.execute(
+            "SELECT identifier FROM catalog "
+            "WHERE content_token IS NULL OR content_token = ''"
+        ).fetchall()
+        for row in missing:
+            self._conn.execute(
+                "UPDATE catalog SET content_token = ? WHERE identifier = ?",
+                (uuid.uuid4().hex, row["identifier"]),
             )
 
     def _recover_interrupted_runs(self) -> None:
@@ -479,19 +521,35 @@ class Store:
                 deletions = 0
                 for row in rows:
                     if row["deleted"]:
+                        # The row is gone; any duplicate judgement that named
+                        # it stops being valid because its content token can no
+                        # longer be resolved.
                         self._conn.execute(
                             "DELETE FROM catalog WHERE identifier = ?",
                             (row["identifier"],),
                         )
                         deletions += 1
                     else:
+                        # A fresh token is minted for inserts and for content
+                        # changes.  Re-reading identical text keeps the old
+                        # token, so judgements survive inclusive-window
+                        # re-reads.  Tokens are never reused, so restored
+                        # identical text cannot revive an invalidated
+                        # judgement.
                         self._conn.execute(
                             """
                             INSERT INTO catalog
                                 (identifier, title, creator, source_datestamp,
-                                 harvested_at)
-                            VALUES (?, ?, ?, ?, ?)
+                                 harvested_at, content_token)
+                            VALUES (?, ?, ?, ?, ?, ?)
                             ON CONFLICT(identifier) DO UPDATE SET
+                                content_token = CASE
+                                    WHEN catalog.title = excluded.title
+                                     AND COALESCE(catalog.creator, '')
+                                         = COALESCE(excluded.creator, '')
+                                    THEN catalog.content_token
+                                    ELSE excluded.content_token
+                                END,
                                 title = excluded.title,
                                 creator = excluded.creator,
                                 source_datestamp = excluded.source_datestamp,
@@ -503,6 +561,7 @@ class Store:
                                 row["creator"],
                                 row["datestamp"],
                                 now,
+                                uuid.uuid4().hex,
                             ),
                         )
                         upserts += 1
@@ -586,6 +645,231 @@ class Store:
                 self._clear_active_if(run_id)
                 self._conn.execute("COMMIT")
                 return cur.rowcount > 0
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    # -------------------------------------------------------------- duplicates
+    def _catalog_snapshot(self) -> dict[str, dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT identifier, title, creator, content_token
+              FROM catalog ORDER BY identifier
+            """
+        ).fetchall()
+        return {
+            row["identifier"]: {
+                "identifier": row["identifier"],
+                "title": row["title"],
+                "creator": row["creator"],
+                "content_token": row["content_token"],
+            }
+            for row in rows
+        }
+
+    def _latest_judgements(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT j.*
+              FROM duplicate_judgements j
+              JOIN (
+                    SELECT left_identifier, right_identifier, MAX(id) AS latest_id
+                      FROM duplicate_judgements
+                     GROUP BY left_identifier, right_identifier
+                   ) latest
+                ON latest.latest_id = j.id
+             ORDER BY j.id DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _judgement_row(
+        judgement: dict[str, Any],
+        snapshot: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """The judgement with its two records, or ``None`` when it is expired.
+
+        A judgement stays valid only while both identifiers still exist in the
+        published catalogue *and* their content tokens are unchanged.  A
+        content correction or a withdrawal therefore expires it; a later
+        harvest that restores the same text mints a new token, so the old
+        judgement does not come back to life.
+        """
+        left = snapshot.get(judgement["left_identifier"])
+        right = snapshot.get(judgement["right_identifier"])
+        if left is None or right is None:
+            return None
+        if (
+            left["content_token"] != judgement["left_token"]
+            or right["content_token"] != judgement["right_token"]
+        ):
+            return None
+        return {
+            "id": judgement["id"],
+            "verdict": judgement["verdict"],
+            "created_at": judgement["created_at"],
+            "left": {
+                "identifier": left["identifier"],
+                "title": left["title"],
+                "creator": left["creator"],
+            },
+            "right": {
+                "identifier": right["identifier"],
+                "title": right["title"],
+                "creator": right["creator"],
+            },
+        }
+
+    def duplicate_overview(self) -> dict[str, Any]:
+        """Pending candidate pairs plus judgements that are still valid."""
+        with self._lock:
+            snapshot = self._catalog_snapshot()
+            latest = self._latest_judgements()
+            valid: list[dict[str, Any]] = []
+            decided: set[tuple[str, str]] = set()
+            for judgement in latest:
+                row = self._judgement_row(judgement, snapshot)
+                if row is not None:
+                    valid.append(row)
+                    decided.add(
+                        (judgement["left_identifier"], judgement["right_identifier"])
+                    )
+
+            groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for item in snapshot.values():
+                groups.setdefault(
+                    grouping_key(item["title"], item["creator"]), []
+                ).append(item)
+
+            pending: list[dict[str, Any]] = []
+            for key in sorted(groups):
+                members = groups[key]
+                if len(members) < 2:
+                    continue
+                for i, left in enumerate(members):
+                    for right in members[i + 1 :]:
+                        pair = canonical_identifiers(
+                            left["identifier"], right["identifier"]
+                        )
+                        if pair in decided:
+                            continue
+                        pending.append(
+                            {
+                                "left": {
+                                    "identifier": left["identifier"],
+                                    "title": left["title"],
+                                    "creator": left["creator"],
+                                    "content_token": left["content_token"],
+                                },
+                                "right": {
+                                    "identifier": right["identifier"],
+                                    "title": right["title"],
+                                    "creator": right["creator"],
+                                    "content_token": right["content_token"],
+                                },
+                                "key_title": key[0],
+                                "key_creator": key[1],
+                            }
+                        )
+            return {
+                "pending": pending,
+                "valid": valid,
+                "counts": {
+                    "pending": len(pending),
+                    "valid": len(valid),
+                },
+            }
+
+    def record_judgement(
+        self,
+        left_identifier: str,
+        right_identifier: str,
+        left_token: str,
+        right_token: str,
+        verdict: str,
+    ) -> dict[str, Any]:
+        """Store a reviewer's verdict, rejecting stale or invalid submissions.
+
+        The caller must pass the content tokens it saw when rendering the pair.
+        Inside one ``BEGIN IMMEDIATE`` transaction the pair is re-read from the
+        published catalogue: if either record disappeared, its content changed,
+        or the two are no longer a candidate pair, the submission is rejected
+        as stale and the current overview is returned for redisplay.
+        """
+        if verdict not in ("same", "different"):
+            raise ValueError("判定只能是 same 或 different")
+        submitted = {left_identifier: left_token, right_identifier: right_token}
+        a, b = canonical_identifiers(left_identifier, right_identifier)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT identifier, title, creator, content_token
+                      FROM catalog WHERE identifier IN (?, ?)
+                    """,
+                    (a, b),
+                ).fetchall()
+                current = {row["identifier"]: dict(row) for row in rows}
+                reason: str | None = None
+                if a == b or set(current) != {a, b}:
+                    reason = "候选对已不存在（书目已撤回或标识变化）"
+                elif any(
+                    current[identifier]["content_token"] != token
+                    for identifier, token in submitted.items()
+                ):
+                    reason = "书目内容已更新，提交的判定已过期"
+                elif grouping_key(
+                    current[a]["title"], current[a]["creator"]
+                ) != grouping_key(current[b]["title"], current[b]["creator"]):
+                    reason = "两条书目已不再属于同一候选组"
+
+                if reason is not None:
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "accepted": False,
+                        "reason": reason,
+                        "overview": self.duplicate_overview(),
+                    }
+
+                now = utc_now_millis()
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO duplicate_judgements
+                        (left_identifier, right_identifier, left_token,
+                         right_token, verdict, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        a,
+                        b,
+                        current[a]["content_token"],
+                        current[b]["content_token"],
+                        verdict,
+                        now,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return {
+                    "accepted": True,
+                    "judgement": {
+                        "id": cur.lastrowid,
+                        "verdict": verdict,
+                        "created_at": now,
+                        "left": {
+                            "identifier": a,
+                            "title": current[a]["title"],
+                            "creator": current[a]["creator"],
+                        },
+                        "right": {
+                            "identifier": b,
+                            "title": current[b]["title"],
+                            "creator": current[b]["creator"],
+                        },
+                    },
+                    "overview": self.duplicate_overview(),
+                }
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise

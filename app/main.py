@@ -4,9 +4,13 @@ Pages
 -----
 ``/``                          catalogue browser, watermark, run controls
 ``/runs``                      round history (windows, attempts, restarts, errors)
+``/duplicates``                duplicate candidate pairs and still-valid verdicts
 ``/status``                    statically rendered status JSON
 ``GET  /api/status``           polling endpoint used by the page
 ``GET  /api/catalog``          catalogue JSON (search + pagination)
+``GET  /api/duplicates``       candidate pairs + valid verdicts as JSON
+``POST /api/duplicates/judgements``  record one reviewer verdict (JSON)
+``POST /duplicates/judgements``      same, from the HTML form
 ``POST /api/harvest``          start a round
 ``POST /api/harvest/cancel``   cancel the active round without waiting for it
 ``POST /api/harvest/restart``  cancel (if any) and immediately start a new round
@@ -18,9 +22,10 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -134,6 +139,102 @@ def create_app(
     @app.get("/api/status")
     async def api_status() -> JSONResponse:
         return JSONResponse(status_payload())
+
+    @app.get("/duplicates", response_class=HTMLResponse)
+    async def duplicates_page(
+        request: Request,
+        message: str | None = None,
+        error: str | None = None,
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request,
+            "duplicates.html",
+            {
+                "duplicates": store.duplicate_overview(),
+                "published": store.published_state(),
+                "status": status_payload(),
+                "message": message,
+                "error": error,
+            },
+        )
+
+    @app.get("/api/duplicates")
+    async def api_duplicates() -> JSONResponse:
+        return JSONResponse(store.duplicate_overview())
+
+    @app.post("/api/duplicates/judgements")
+    async def api_record_judgement(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+        try:
+            left = str(payload["left_identifier"])
+            right = str(payload["right_identifier"])
+            left_token = str(payload["left_token"])
+            right_token = str(payload["right_token"])
+            verdict = str(payload["verdict"])
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="需要 left_identifier/right_identifier/left_token/"
+                "right_token/verdict",
+            ) from exc
+        if verdict not in ("same", "different"):
+            raise HTTPException(
+                status_code=400, detail="verdict 只能是 same 或 different"
+            )
+        result = store.record_judgement(
+            left, right, left_token, right_token, verdict
+        )
+        if not result["accepted"]:
+            # A stale submission is a conflict: the page must show the current
+            # candidates instead of silently applying an outdated verdict.
+            return JSONResponse(
+                {
+                    "accepted": False,
+                    "reason": result["reason"],
+                    "duplicates": result["overview"],
+                },
+                status_code=409,
+            )
+        return JSONResponse(
+            {
+                "accepted": True,
+                "judgement": result["judgement"],
+                "duplicates": result["overview"],
+            }
+        )
+
+    @app.post("/duplicates/judgements")
+    async def form_record_judgement(
+        left_identifier: str = Form(...),
+        right_identifier: str = Form(...),
+        left_token: str = Form(...),
+        right_token: str = Form(...),
+        verdict: str = Form(...),
+    ) -> RedirectResponse:
+        if verdict not in ("same", "different"):
+            return RedirectResponse(
+                url="/duplicates?error=" + quote("判定只能是同一成果或不同成果"),
+                status_code=303,
+            )
+        result = store.record_judgement(
+            left_identifier, right_identifier, left_token, right_token, verdict
+        )
+        if not result["accepted"]:
+            return RedirectResponse(
+                url="/duplicates?error=" + quote(result["reason"]),
+                status_code=303,
+            )
+        message = "已记录判定：" + (
+            "同一成果" if result["judgement"]["verdict"] == "same" else "不同成果"
+        )
+        return RedirectResponse(
+            url="/duplicates?message=" + quote(message), status_code=303
+        )
 
     @app.get("/status")
     async def status_page(request: Request) -> HTMLResponse:

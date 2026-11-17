@@ -128,6 +128,21 @@ class DemoRepo:
                 ("oai:demo:0008", "古籍数字化中的图像检索", "钱程", 3600 * 24 * 5),
                 ("oai:demo:0009", "下一代图书馆服务平台的架构设计", "冯雪", 3600 * 24 * 2),
                 ("oai:demo:0010", "Altmetrics 在机构库评价中的应用", "何川", 3600),
+                # A deliberately duplicated work (different identifiers).  The
+                # title/creator differ only in outer spaces and letter case, so
+                # the duplicate review page demonstrates its pairing rule.
+                (
+                    "oai:demo:0011",
+                    "Digital Humanities Text Mining",
+                    "Alice Chen",
+                    3600 * 24 * 3,
+                ),
+                (
+                    "oai:demo:0012",
+                    "  digital humanities text mining  ",
+                    " ALICE CHEN ",
+                    3600 * 24 * 2,
+                ),
             ]
             for identifier, title, creator, age in seeds:
                 self._conn.execute(

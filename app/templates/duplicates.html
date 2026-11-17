@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>重复书目核查</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>重复书目核查</h1>
+    <p class="sub">标题与作者去首尾空白、统一大小写后相同 · 不同标识的候选对 · 逐对判定</p>
+  </div>
+  <nav>
+    <a href="/">目录</a>
+    <a href="/duplicates">重复核查</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+{% if message %}<div class="flash">{{ message }}</div>{% endif %}
+{% if error %}<div class="flash error">提交未生效：{{ error }}。以下为当前候选与仍有效的判定。</div>{% endif %}
+
+<main class="panel">
+  <div class="meta-grid">
+    <div><span class="label">待核查候选对</span><strong>{{ duplicates.counts.pending }}</strong></div>
+    <div><span class="label">仍有效的判定</span><strong>{{ duplicates.counts.valid }}</strong></div>
+    <div><span class="label">已发布目录条数</span><strong>{{ published.catalog_size }}</strong></div>
+    <div><span class="label">已发布水位</span><strong class="mono small">{{ published.watermark or "（尚未成功采集）" }}</strong></div>
+  </div>
+
+  <p class="hint">
+    判定只对提交时两条书目的已发布内容有效：任何一条被更正（标题或作者变化）或被撤回后，
+    该判定立即失效；此后即使采集再次发布完全相同的文字，也不会恢复旧判定。
+    闭区间重读相同内容不会使判定失效。采集失败或取消不改动已发布内容，因此不影响任何判定。
+  </p>
+
+  <h2>待核查候选对</h2>
+  <table class="records duplicates">
+    <thead>
+      <tr><th>归一化标题 / 作者</th><th>书目 A</th><th>书目 B</th><th>判定</th></tr>
+    </thead>
+    <tbody>
+    {% for pair in duplicates.pending %}
+      <tr>
+        <td class="small">
+          <div><strong>{{ pair.left.title }}</strong></div>
+          <div class="muted">{{ pair.left.creator or "（无作者）" }}</div>
+          <div class="mono tiny">key: {{ pair.key_title }} || {{ pair.key_creator }}</div>
+        </td>
+        <td>
+          <div class="mono small">{{ pair.left.identifier }}</div>
+          <div>{{ pair.left.title }}</div>
+          <div class="muted small">{{ pair.left.creator or "—" }}</div>
+        </td>
+        <td>
+          <div class="mono small">{{ pair.right.identifier }}</div>
+          <div>{{ pair.right.title }}</div>
+          <div class="muted small">{{ pair.right.creator or "—" }}</div>
+        </td>
+        <td class="verdict-cell">
+          <form method="post" action="/duplicates/judgements" class="verdict-form">
+            <input type="hidden" name="left_identifier" value="{{ pair.left.identifier }}">
+            <input type="hidden" name="right_identifier" value="{{ pair.right.identifier }}">
+            <input type="hidden" name="left_token" value="{{ pair.left.content_token }}">
+            <input type="hidden" name="right_token" value="{{ pair.right.content_token }}">
+            <button class="primary" type="submit" name="verdict" value="same">同一成果</button>
+            <button type="submit" name="verdict" value="different">不同成果</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4" class="empty">
+        没有待核查的候选对。{% if published.catalog_size == 0 %}目录为空，请先在首页完成一次采集。{% endif %}
+      </td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>仍有效的判定</h2>
+  <table class="records duplicates">
+    <thead>
+      <tr><th>结论</th><th>书目 A</th><th>书目 B</th><th>判定时间</th><th>判定编号</th></tr>
+    </thead>
+    <tbody>
+    {% for item in duplicates.valid %}
+      <tr>
+        <td>
+          {% if item.verdict == "same" %}
+            <span class="badge same">同一成果</span>
+          {% else %}
+            <span class="badge different">不同成果</span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="mono small">{{ item.left.identifier }}</div>
+          <div>{{ item.left.title }}</div>
+          <div class="muted small">{{ item.left.creator or "—" }}</div>
+        </td>
+        <td>
+          <div class="mono small">{{ item.right.identifier }}</div>
+          <div>{{ item.right.title }}</div>
+          <div class="muted small">{{ item.right.creator or "—" }}</div>
+        </td>
+        <td class="mono small">{{ item.created_at }}</td>
+        <td class="mono small">{{ item.id }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="empty">还没有仍有效的判定。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="hint">
+    已失效的判定不会出现在上表，也不会自动重新生成候选对说明；若对应书目再次成为候选，
+    它们会重新出现在“待核查候选对”中，需要重新判定。
+  </p>
+</main>
+</body>
+</html>

@@ -66,6 +66,15 @@ table.records th, table.records td {
 }
 table.records th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
 table.records td.small, .small { font-size: 12px; }
+.flash.error {
+  background: #fdecea; border-color: #f3c4be; color: #8c2c20;
+}
+.verdict-cell { min-width: 190px; }
+.verdict-form { display: flex; gap: 6px; flex-wrap: wrap; }
+.verdict-form button { padding: 6px 10px; font-size: 13px; }
+.badge.same { background: #e3f5ea; color: var(--ok); }
+.badge.different { background: #eef1f5; color: var(--muted); }
+.tiny { font-size: 11px; color: var(--muted); word-break: break-all; }
 .empty { color: var(--muted); text-align: center; padding: 34px 0 !important; }
 
 .search { display: flex; gap: 6px; }

@@ -72,6 +72,25 @@ async def _shutdown_harvesters():
     yield
 
 
+@pytest.fixture
+def web_app_like(tmp_path: Path, demo_app):
+    """A real app instance sharing an explicit Store, for HTTP-level tests."""
+    from app.main import create_app
+
+    def factory() -> OaiClient:
+        return OaiClient(
+            "http://demo.local/oai",
+            transport=httpx.ASGITransport(app=demo_app),
+        )
+
+    app = create_app(
+        db_path=tmp_path / "web.sqlite3",
+        oai_url="http://demo.local/oai",
+        client_factory=factory,
+    )
+    return app, app.state.store
+
+
 async def wait_for_outcome(control, timeout: float = 20.0) -> str:
     """Wait for a run to settle without requiring the task not to be cancelled."""
     try:
